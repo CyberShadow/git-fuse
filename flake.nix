@@ -71,6 +71,15 @@
             pkg-config
           ];
         };
+
+        # Integration tests (only on Linux, requires VM)
+        checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          integration = import ./ci/tests/nixos-test.nix {
+            inherit (pkgs) lib;
+            inherit pkgs;
+            inherit git-fuse;
+          };
+        };
       }
     );
 }
