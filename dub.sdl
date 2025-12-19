@@ -1,0 +1,8 @@
+name "git-fuse"
+description "FUSE filesystem for mounting Git repositories"
+authors "Vladimir Panteleev"
+license "MPL 2.0"
+targetType "executable"
+sourceFiles "git_fuse.d"
+dependency "ae" path="../ae-container/ae"
+dependency "dfuse" version="==0.4.1"
