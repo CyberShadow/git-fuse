@@ -49,9 +49,58 @@ pragma(lib, "fuse");
 __gshared
 {
     Git repo;
-    GitIndex index;
-    bool indexDirty;
-    MonoTime indexLoadTime;
+}
+
+//==============================================================================
+// Index entry cache (refreshed from git ls-files on each operation)
+//==============================================================================
+
+struct IndexEntry
+{
+    uint mode;
+    Git.OID oid;
+    string path;
+}
+
+/// Get all index entries using git ls-files
+IndexEntry[] getIndexEntries()
+{
+    IndexEntry[] entries;
+
+    // Use -z for null-separated output (safe for paths with special chars)
+    auto output = repo.query("ls-files", "--stage", "-z");
+
+    foreach (line; output.split('\0'))
+    {
+        if (line.length == 0) continue;
+
+        // Format: <mode> <hash> <stage>\t<path>
+        auto tabPos = line.indexOf('\t');
+        if (tabPos < 0) continue;
+
+        auto meta = line[0 .. tabPos];
+        auto path = line[tabPos + 1 .. $];
+
+        auto parts = meta.split(' ');
+        if (parts.length < 3) continue;
+
+        IndexEntry entry;
+        entry.mode = parts[0].to!uint(8);
+        entry.oid = Git.OID(parts[1]);
+        entry.path = path;
+        entries ~= entry;
+    }
+
+    return entries;
+}
+
+/// Find an index entry by path
+Nullable!IndexEntry findIndexEntry(string path)
+{
+    foreach (entry; getIndexEntries())
+        if (entry.path == path)
+            return Nullable!IndexEntry(entry);
+    return Nullable!IndexEntry.init;
 }
 
 
@@ -158,17 +207,14 @@ struct FusePath
 /// Check if a path exists as a file in the index
 bool isIndexFile(string path)
 {
-    foreach (ref entry; index.entries)
-        if (entry.path == path)
-            return true;
-    return false;
+    return !findIndexEntry(path).isNull;
 }
 
 /// Check if a path exists as a directory in the index
 bool isIndexDir(string path)
 {
     auto prefix = path.length > 0 ? path ~ "/" : "";
-    foreach (ref entry; index.entries)
+    foreach (entry; getIndexEntries())
         if (entry.path.startsWith(prefix))
             return true;
     return false;
@@ -178,22 +224,22 @@ bool isIndexDir(string path)
 string[] getIndexDirEntries(string dirPath)
 {
     auto prefix = dirPath.length > 0 ? dirPath ~ "/" : "";
-    bool[string] entries;
+    bool[string] names;
 
-    foreach (ref entry; index.entries)
+    foreach (entry; getIndexEntries())
     {
         if (entry.path.startsWith(prefix))
         {
             auto rest = entry.path[prefix.length .. $];
             auto slashPos = rest.indexOf('/');
             if (slashPos >= 0)
-                entries[rest[0 .. slashPos]] = true;
+                names[rest[0 .. slashPos]] = true;
             else
-                entries[rest] = true;
+                names[rest] = true;
         }
     }
 
-    return entries.keys.sort.array;
+    return names.keys.sort.array;
 }
 
 
@@ -229,48 +275,41 @@ int fuseWrap(scope void delegate() dg) nothrow
 
 
 //==============================================================================
-// Index operations
+// Index operations (using git plumbing commands)
 //==============================================================================
 
-/// Reload index if it has changed on disk
-void refreshIndex()
-{
-    // Don't reload if we have pending changes
-    if (indexDirty)
-        return;
-
-    auto indexPath = repo.gitDir.buildPath("index");
-    if (!indexPath.exists)
-    {
-        index = GitIndex.init;
-        indexDirty = false;
-        return;
-    }
-
-    // Check if file was modified since we last loaded it
-    // For simplicity, just reload every time for now
-    // A more sophisticated approach would check mtime
-    index = repo.readIndex();
-    indexDirty = false;
-    indexLoadTime = MonoTime.currTime;
-}
-
-/// Save index if dirty
-void flushIndex()
-{
-    if (indexDirty)
-    {
-        repo.writeIndex(index);
-        indexDirty = false;
-    }
-}
-
-/// Read blob content for an index entry
-immutable(ubyte)[] readIndexBlob(ref const GitIndex.Entry entry)
+/// Read blob content by OID
+immutable(ubyte)[] readBlob(Git.OID oid)
 {
     auto reader = repo.createObjectReader();
-    auto obj = reader.read(entry.oid);
+    auto obj = reader.read(oid);
     return obj.data;
+}
+
+/// Write blob and return its OID
+Git.OID writeBlob(const(ubyte)[] data)
+{
+    auto writer = repo.createObjectWriter("blob");
+    return writer.write(cast(immutable(ubyte)[])data);
+}
+
+/// Update an index entry using git update-index (handles locking)
+void updateIndexEntry(uint mode, Git.OID oid, string path)
+{
+    repo.run("update-index", "--add", "--cacheinfo",
+        format!"%o,%s,%s"(mode, oid.toString(), path));
+}
+
+/// Remove an index entry using git update-index (handles locking)
+void removeIndexEntry(string path)
+{
+    repo.run("update-index", "--force-remove", path);
+}
+
+/// Change executable mode of an index entry
+void chmodIndexEntry(string path, bool executable)
+{
+    repo.run("update-index", executable ? "--chmod=+x" : "--chmod=-x", path);
 }
 
 
@@ -445,30 +484,30 @@ extern(C) nothrow
                     return;
 
                 case FusePath.Type.indexFile:
-                    refreshIndex();
-                    auto entry = index.findEntry(fusePath.indexPath);
-                    if (!entry)
+                    auto entryOpt = findIndexEntry(fusePath.indexPath);
+                    if (entryOpt.isNull)
                         throw new ErrnoException("", ENOENT);
+                    auto entry = entryOpt.get;
 
-                    if (entry.isSymlink)
+                    // Check mode for file type
+                    if ((entry.mode & octal!170000) == octal!120000)
                         s.st_mode = S_IFLNK | octal!777;
-                    else if (entry.isExecutable)
+                    else if ((entry.mode & octal!111) != 0)
                         s.st_mode = S_IFREG | octal!755;
                     else
                         s.st_mode = S_IFREG | octal!644;
 
                     s.st_nlink = 1;
-                    s.st_size = entry.fileSize;
 
-                    // Read actual blob size if fileSize is 0 or might be stale
-                    if (s.st_size == 0)
+                    // Get actual blob size
+                    try
                     {
-                        try
-                        {
-                            auto data = readIndexBlob(*entry);
-                            s.st_size = data.length;
-                        }
-                        catch (Exception) {}
+                        auto data = readBlob(entry.oid);
+                        s.st_size = data.length;
+                    }
+                    catch (Exception)
+                    {
+                        s.st_size = 0;
                     }
                     return;
 
@@ -534,7 +573,6 @@ extern(C) nothrow
 
                 case FusePath.Type.indexRoot:
                 case FusePath.Type.indexDir:
-                    refreshIndex();
                     auto dirPath = fusePath.type == FusePath.Type.indexRoot ? "" : fusePath.indexPath;
                     foreach (name; getIndexDirEntries(dirPath))
                         filler(buf, cast(char*)name.toStringz, null, 0);
@@ -583,11 +621,10 @@ extern(C) nothrow
                     throw new ErrnoException("", EISDIR);
 
                 case FusePath.Type.indexFile:
-                    refreshIndex();
-                    auto entry = index.findEntry(fusePath.indexPath);
-                    if (!entry)
+                    auto entryOpt = findIndexEntry(fusePath.indexPath);
+                    if (entryOpt.isNull)
                         throw new ErrnoException("", ENOENT);
-                    data = readIndexBlob(*entry);
+                    data = readBlob(entryOpt.get.oid);
                     break;
 
                 case FusePath.Type.commitDir:
@@ -623,16 +660,16 @@ extern(C) nothrow
             if (fusePath.type != FusePath.Type.indexFile)
                 throw new ErrnoException("", EROFS);
 
-            refreshIndex();
-            auto entry = index.findEntry(fusePath.indexPath);
-            if (!entry)
+            auto entryOpt = findIndexEntry(fusePath.indexPath);
+            if (entryOpt.isNull)
                 throw new ErrnoException("", ENOENT);
+            auto entry = entryOpt.get;
 
             // Read existing content
             ubyte[] content;
             try
             {
-                content = readIndexBlob(*entry).dup;
+                content = readBlob(entry.oid).dup;
             }
             catch (Exception)
             {
@@ -647,14 +684,9 @@ extern(C) nothrow
             // Write new data
             content[offset .. offset + size] = cast(ubyte[])data_ptr[0 .. size];
 
-            // Write to git object store
-            auto writer = repo.createObjectWriter();
-            auto newOid = writer.write(cast(immutable(ubyte)[])content);
-
-            // Update index entry
-            entry.oid = newOid;
-            entry.fileSize = cast(uint)content.length;
-            indexDirty = true;
+            // Write blob and update index (git update-index handles locking)
+            auto newOid = writeBlob(content);
+            updateIndexEntry(entry.mode, newOid, fusePath.indexPath);
 
             return cast(int)size;
         });
@@ -670,16 +702,16 @@ extern(C) nothrow
 
             enforce(length >= 0, new ErrnoException("", EINVAL));
 
-            refreshIndex();
-            auto entry = index.findEntry(fusePath.indexPath);
-            if (!entry)
+            auto entryOpt = findIndexEntry(fusePath.indexPath);
+            if (entryOpt.isNull)
                 throw new ErrnoException("", ENOENT);
+            auto entry = entryOpt.get;
 
             // Read existing content
             ubyte[] content;
             try
             {
-                content = readIndexBlob(*entry).dup;
+                content = readBlob(entry.oid).dup;
             }
             catch (Exception)
             {
@@ -689,14 +721,9 @@ extern(C) nothrow
             // Truncate or extend
             content.length = length;
 
-            // Write to git object store
-            auto writer = repo.createObjectWriter();
-            auto newOid = writer.write(cast(immutable(ubyte)[])content);
-
-            // Update index entry
-            entry.oid = newOid;
-            entry.fileSize = cast(uint)length;
-            indexDirty = true;
+            // Write blob and update index (git update-index handles locking)
+            auto newOid = writeBlob(content);
+            updateIndexEntry(entry.mode, newOid, fusePath.indexPath);
         });
     }
 
@@ -725,21 +752,10 @@ extern(C) nothrow
 
             enforce(S_ISREG(mode), new ErrnoException("", EOPNOTSUPP));
 
-            refreshIndex();
-
-            // Create empty blob
-            auto writer = repo.createObjectWriter();
-            auto emptyOid = writer.write(cast(immutable(ubyte)[])[]);
-
-            // Create index entry
-            GitIndex.Entry newEntry;
-            newEntry.path = indexPath;
-            newEntry.oid = emptyOid;
-            newEntry.mode = (mode & octal!111) ? octal!100755 : octal!100644;
-            newEntry.fileSize = 0;
-
-            index.upsertEntry(newEntry);
-            indexDirty = true;
+            // Create empty blob and add to index (git update-index handles locking)
+            auto emptyOid = writeBlob([]);
+            auto gitMode = (mode & octal!111) ? octal!100755 : octal!100644;
+            updateIndexEntry(gitMode, emptyOid, indexPath);
         });
     }
 
@@ -751,10 +767,8 @@ extern(C) nothrow
             if (fusePath.type != FusePath.Type.indexFile)
                 throw new ErrnoException("", EROFS);
 
-            refreshIndex();
-            if (!index.removeEntry(fusePath.indexPath))
-                throw new ErrnoException("", ENOENT);
-            indexDirty = true;
+            // git update-index --force-remove handles locking
+            removeIndexEntry(fusePath.indexPath);
         });
     }
 
@@ -791,7 +805,6 @@ extern(C) nothrow
     {
         return fuseWrap({
             auto fromPath = FusePath.parse(c_from);
-            auto toPath = FusePath.parse(c_to);
 
             // Only index files can be renamed
             if (fromPath.type != FusePath.Type.indexFile)
@@ -803,24 +816,19 @@ extern(C) nothrow
 
             auto newIndexPath = toPathStr[7 .. $];
 
-            refreshIndex();
-
             // Find source entry
-            auto entry = index.findEntry(fromPath.indexPath);
-            if (!entry)
+            auto entryOpt = findIndexEntry(fromPath.indexPath);
+            if (entryOpt.isNull)
                 throw new ErrnoException("", ENOENT);
+            auto entry = entryOpt.get;
 
-            // Check if target exists
-            if (index.findEntry(newIndexPath))
-                index.removeEntry(newIndexPath);
+            // Remove target if exists, add new entry, remove old entry
+            // git update-index handles locking for each operation
+            if (!findIndexEntry(newIndexPath).isNull)
+                removeIndexEntry(newIndexPath);
 
-            // Update path
-            auto newEntry = *entry;
-            newEntry.path = newIndexPath;
-
-            index.removeEntry(fromPath.indexPath);
-            index.upsertEntry(newEntry);
-            indexDirty = true;
+            updateIndexEntry(entry.mode, entry.oid, newIndexPath);
+            removeIndexEntry(fromPath.indexPath);
         });
     }
 
@@ -832,16 +840,16 @@ extern(C) nothrow
             if (fusePath.type != FusePath.Type.indexFile)
                 throw new ErrnoException("", EROFS);
 
-            refreshIndex();
-            auto entry = index.findEntry(fusePath.indexPath);
-            if (!entry)
+            auto entryOpt = findIndexEntry(fusePath.indexPath);
+            if (entryOpt.isNull)
                 throw new ErrnoException("", ENOENT);
+            auto entry = entryOpt.get;
 
             // Git only tracks executable bit for regular files
-            if (!entry.isSymlink)
+            if ((entry.mode & octal!170000) != octal!120000) // not symlink
             {
-                entry.mode = (mode & octal!111) ? octal!100755 : octal!100644;
-                indexDirty = true;
+                // Use git update-index --chmod (handles locking)
+                chmodIndexEntry(fusePath.indexPath, (mode & octal!111) != 0);
             }
         });
     }
@@ -876,51 +884,19 @@ extern(C) nothrow
             {
                 if (fusePath.type == FusePath.Type.indexFile)
                 {
-                    refreshIndex();
-                    auto entry = index.findEntry(fusePath.indexPath);
-                    if (entry)
+                    auto entryOpt = findIndexEntry(fusePath.indexPath);
+                    if (!entryOpt.isNull)
                     {
-                        // Truncate to empty
-                        auto writer = repo.createObjectWriter();
-                        auto newOid = writer.write(cast(immutable(ubyte)[])[]);
-                        entry.oid = newOid;
-                        entry.fileSize = 0;
-                        indexDirty = true;
+                        // Truncate to empty (git update-index handles locking)
+                        auto emptyOid = writeBlob([]);
+                        updateIndexEntry(entryOpt.get.mode, emptyOid, fusePath.indexPath);
                     }
                 }
             }
         });
     }
 
-    int fs_flush(const char* c_path, fuse_file_info* fi)
-    {
-        return fuseWrap({
-            flushIndex();
-        });
-    }
-
-    int fs_fsync(const char* c_path, int datasync, fuse_file_info* fi)
-    {
-        return fuseWrap({
-            flushIndex();
-        });
-    }
-
-    int fs_release(const char* c_path, fuse_file_info* fi)
-    {
-        return fuseWrap({
-            flushIndex();
-        });
-    }
-
-    void fs_destroy(void* private_data)
-    {
-        try
-        {
-            flushIndex();
-        }
-        catch (Exception) {}
-    }
+    // No flush/fsync/release/destroy needed - each git update-index is atomic
 }
 
 
@@ -938,9 +914,6 @@ int gitFuse(
     // Initialize repository
     repo = Git(repoPath.absolutePath);
 
-    // Load initial index
-    refreshIndex();
-
     // Setup FUSE operations
     fuse_operations fsops;
     fsops.getattr = &fs_getattr;
@@ -956,10 +929,6 @@ int gitFuse(
     fsops.chmod = &fs_chmod;
     fsops.access = &fs_access;
     fsops.open = &fs_open;
-    fsops.flush = &fs_flush;
-    fsops.fsync = &fs_fsync;
-    fsops.release = &fs_release;
-    fsops.destroy = &fs_destroy;
 
     // Build FUSE arguments
     string[] args = ["git-fuse", mountPath];
