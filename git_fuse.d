@@ -4,7 +4,8 @@
  * Features:
  * - /index/ - Read-write access to the Git staging area
  * - /commits/<sha>/ - Read-only access to commits by hash
- * - /refs/<refname>/ - Read-only access to refs (branches, tags)
+ * - /refs/<refpath>/ - Read-only access to refs (branches, tags) as symlinks to commits
+ * - /HEAD - Symlink to the current branch ref or commit
  *
  * License:
  *   This Source Code Form is subject to the terms of
@@ -106,13 +107,177 @@ Nullable!IndexEntry findIndexEntry(string path)
 
 
 //==============================================================================
+// Ref resolution
+//==============================================================================
+
+/// Result of resolving a ref path
+struct ResolvedRef
+{
+    string refName;  // the ref name (e.g., "heads/master")
+    string treePath; // remaining path within the tree
+}
+
+/// Try to resolve a path under refs/ to a ref name and tree path
+ResolvedRef resolveRefPath(string path)
+{
+    ResolvedRef result;
+
+    // Try progressively longer paths as ref names
+    auto parts = path.split("/");
+    for (size_t i = parts.length; i >= 1; i--)
+    {
+        auto candidate = parts[0 .. i].join("/");
+        if (isValidRef("refs/" ~ candidate))
+        {
+            result.refName = candidate;
+            result.treePath = i < parts.length ? parts[i .. $].join("/") : "";
+            return result;
+        }
+    }
+
+    return result;
+}
+
+/// Check if a ref exists
+bool isValidRef(string refName)
+{
+    try
+    {
+        repo.query("rev-parse", "--verify", "--quiet", refName);
+        return true;
+    }
+    catch (Exception)
+    {
+        return false;
+    }
+}
+
+/// Resolve a ref to its commit SHA
+string resolveRef(string refName)
+{
+    try
+    {
+        return repo.query("rev-parse", refName).strip();
+    }
+    catch (Exception)
+    {
+        return "";
+    }
+}
+
+/// Get the symbolic ref target (for HEAD -> refs/heads/master)
+Nullable!string getSymbolicRef(string refName)
+{
+    try
+    {
+        auto target = repo.query("symbolic-ref", "--quiet", refName).strip();
+        return Nullable!string(target);
+    }
+    catch (Exception)
+    {
+        return Nullable!string.init;
+    }
+}
+
+/// List refs under a prefix (e.g., "refs/heads")
+string[] listRefs(string prefix = "refs")
+{
+    string[] result;
+    try
+    {
+        auto output = repo.query("for-each-ref", "--format=%(refname)", prefix);
+        foreach (line; output.splitter('\n'))
+        {
+            if (line.length > 0)
+                result ~= line.idup;
+        }
+    }
+    catch (Exception)
+    {
+    }
+    return result;
+}
+
+/// Get direct children entries under a refs path (for readdir)
+string[] getRefsChildren(string prefix)
+{
+    bool[string] children;
+
+    auto fullPrefix = prefix.length > 0 ? "refs/" ~ prefix ~ "/" : "refs/";
+    auto refs = listRefs("refs");
+
+    foreach (ref refPath; refs)
+    {
+        if (refPath.startsWith(fullPrefix))
+        {
+            auto rest = refPath[fullPrefix.length .. $];
+            auto slashPos = rest.indexOf('/');
+            if (slashPos >= 0)
+                children[rest[0 .. slashPos]] = true;
+            else
+                children[rest] = true;
+        }
+    }
+
+    return children.keys.sort.array;
+}
+
+/// Check if a refs path is a directory (has children)
+bool isRefsDir(string prefix)
+{
+    auto fullPrefix = "refs/" ~ prefix ~ "/";
+    foreach (ref refPath; listRefs("refs"))
+    {
+        if (refPath.startsWith(fullPrefix))
+            return true;
+    }
+    return false;
+}
+
+/// Get the symlink target for HEAD
+/// Returns a relative symlink like "refs/heads/master" or "commits/<sha>"
+string getHeadSymlinkTarget()
+{
+    // Try to get symbolic ref first (e.g., HEAD -> refs/heads/master)
+    auto symbolic = getSymbolicRef("HEAD");
+    if (!symbolic.isNull)
+        return symbolic.get;
+
+    // Detached HEAD - point to commits/<sha>
+    auto sha = resolveRef("HEAD");
+    if (sha.length > 0)
+        return "commits/" ~ sha;
+
+    return "commits/HEAD"; // fallback
+}
+
+/// Get the symlink target for a ref
+/// Returns a relative symlink to commits/<sha>
+string getRefSymlinkTarget(string refName)
+{
+    auto sha = resolveRef("refs/" ~ refName);
+    if (sha.length > 0)
+    {
+        // Calculate relative path from refs/<refName> to commits/<sha>
+        // e.g., from refs/heads/master, we need ../../../commits/<sha>
+        auto depth = refName.count('/') + 1; // +1 for "refs" itself
+        string prefix;
+        foreach (_; 0 .. depth)
+            prefix ~= "../";
+        return prefix ~ "commits/" ~ sha;
+    }
+    return "";
+}
+
+
+//==============================================================================
 // Path parsing
 //==============================================================================
 
 /// Parsed FUSE path
 struct FusePath
 {
-    enum Type { invalid, root, indexRoot, indexFile, indexDir, commitsRoot, commitDir, commitFile, refsRoot, refDir, refFile }
+    enum Type { invalid, root, indexRoot, indexFile, indexDir, commitsRoot, commitDir, commitFile, refsRoot, refDir, refFile, refSymlink, headSymlink }
     Type type;
 
     // For index paths
@@ -142,6 +307,22 @@ struct FusePath
         }
 
         auto parts = path.split("/");
+
+        // Handle HEAD at root
+        if (parts[0] == "HEAD")
+        {
+            if (parts.length == 1)
+            {
+                result.type = Type.headSymlink;
+                return result;
+            }
+
+            // HEAD/path/to/file - treat as ref access
+            result.commitOrRef = "HEAD";
+            result.treePath = parts[1 .. $].join("/");
+            result.type = Type.refFile; // will be refined in getattr
+            return result;
+        }
 
         if (parts[0] == "index")
         {
@@ -192,10 +373,27 @@ struct FusePath
             }
 
             // refs can have slashes (e.g., refs/heads/master)
-            // We need to find where the ref name ends and tree path begins
-            result.commitOrRef = parts[1 .. $].join("/");
-            result.treePath = "";
-            result.type = Type.refDir;
+            // Try to find where the ref name ends and tree path begins
+            auto refPath = parts[1 .. $].join("/");
+            auto resolved = resolveRefPath(refPath);
+
+            if (resolved.refName.length > 0)
+            {
+                result.commitOrRef = resolved.refName;
+                result.treePath = resolved.treePath;
+
+                if (resolved.treePath.length == 0)
+                    result.type = Type.refSymlink;
+                else
+                    result.type = Type.refFile; // will be refined in getattr
+            }
+            else
+            {
+                // Could be a refs subdirectory (e.g., refs/heads)
+                result.commitOrRef = refPath;
+                result.treePath = "";
+                result.type = Type.refsRoot; // treat as refs subdirectory
+            }
 
             return result;
         }
@@ -559,9 +757,37 @@ extern(C) nothrow
                 case FusePath.Type.indexRoot:
                 case FusePath.Type.indexDir:
                 case FusePath.Type.commitsRoot:
-                case FusePath.Type.refsRoot:
                     s.st_mode = S_IFDIR | octal!755;
                     s.st_nlink = 2;
+                    return;
+
+                case FusePath.Type.refsRoot:
+                    // Check if this is a refs subdirectory
+                    if (fusePath.commitOrRef.length > 0)
+                    {
+                        // refs/heads, refs/tags, etc.
+                        if (!isRefsDir(fusePath.commitOrRef))
+                            throw new ErrnoException("", ENOENT);
+                    }
+                    s.st_mode = S_IFDIR | octal!555;
+                    s.st_nlink = 2;
+                    return;
+
+                case FusePath.Type.headSymlink:
+                    // HEAD is always a symlink
+                    s.st_mode = S_IFLNK | octal!777;
+                    s.st_nlink = 1;
+                    // Size is the length of the symlink target
+                    auto headTarget = getHeadSymlinkTarget();
+                    s.st_size = headTarget.length;
+                    return;
+
+                case FusePath.Type.refSymlink:
+                    // refs/<ref> is a symlink to commits/<sha>
+                    s.st_mode = S_IFLNK | octal!777;
+                    s.st_nlink = 1;
+                    auto refTarget = getRefSymlinkTarget(fusePath.commitOrRef);
+                    s.st_size = refTarget.length;
                     return;
 
                 case FusePath.Type.indexFile:
@@ -649,7 +875,8 @@ extern(C) nothrow
                 case FusePath.Type.root:
                     filler(buf, cast(char*)"index".toStringz, null, 0);
                     filler(buf, cast(char*)"commits".toStringz, null, 0);
-                    // refs omitted for simplicity
+                    filler(buf, cast(char*)"refs".toStringz, null, 0);
+                    filler(buf, cast(char*)"HEAD".toStringz, null, 0);
                     return;
 
                 case FusePath.Type.indexRoot:
@@ -668,8 +895,15 @@ extern(C) nothrow
                     return;
 
                 case FusePath.Type.refsRoot:
-                    // Could list refs here
+                    // List refs under this prefix
+                    auto prefix = fusePath.commitOrRef;
+                    foreach (name; getRefsChildren(prefix))
+                        filler(buf, cast(char*)name.toStringz, null, 0);
                     return;
+
+                case FusePath.Type.headSymlink:
+                case FusePath.Type.refSymlink:
+                    throw new ErrnoException("", ENOTDIR);
 
                 case FusePath.Type.commitDir:
                 case FusePath.Type.refDir:
@@ -700,6 +934,10 @@ extern(C) nothrow
                 case FusePath.Type.commitsRoot:
                 case FusePath.Type.refsRoot:
                     throw new ErrnoException("", EISDIR);
+
+                case FusePath.Type.headSymlink:
+                case FusePath.Type.refSymlink:
+                    throw new ErrnoException("", EINVAL); // symlinks should be followed, not read
 
                 case FusePath.Type.indexFile:
                     auto entryOpt = findIndexEntry(fusePath.indexPath);
@@ -1002,6 +1240,37 @@ extern(C) nothrow
         });
     }
 
+    int fs_readlink(const char* c_path, char* buf, size_t size)
+    {
+        return fuseWrap({
+            auto fusePath = FusePath.parse(c_path);
+
+            string target;
+
+            switch (fusePath.type)
+            {
+                case FusePath.Type.headSymlink:
+                    target = getHeadSymlinkTarget();
+                    break;
+
+                case FusePath.Type.refSymlink:
+                    target = getRefSymlinkTarget(fusePath.commitOrRef);
+                    break;
+
+                default:
+                    throw new ErrnoException("", EINVAL);
+            }
+
+            if (target.length == 0)
+                throw new ErrnoException("", ENOENT);
+
+            // Copy target to buffer (leave room for null terminator)
+            auto copyLen = min(target.length, size - 1);
+            buf[0 .. copyLen] = cast(char[])target[0 .. copyLen];
+            buf[copyLen] = '\0';
+        });
+    }
+
     int fs_open(const char* c_path, fuse_file_info* fi)
     {
         return fuseWrap({
@@ -1056,6 +1325,7 @@ int gitFuse(
     fsops.rename = &fs_rename;
     fsops.chmod = &fs_chmod;
     fsops.access = &fs_access;
+    fsops.readlink = &fs_readlink;
     fsops.open = &fs_open;
 
     // Build FUSE arguments

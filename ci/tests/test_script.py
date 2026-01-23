@@ -235,6 +235,116 @@ def test_rmdir_errors():
     machine.succeed("rm -r /mnt/git/index/nonempty")
 
 
+def test_head_symlink():
+    """Test that HEAD is a symlink pointing to the current branch."""
+    # HEAD should be a symlink
+    machine.succeed("test -L /mnt/git/HEAD")
+
+    # Read the symlink target
+    target = machine.succeed("readlink /mnt/git/HEAD").strip()
+
+    # Should point to refs/heads/master (default branch)
+    assert target == "refs/heads/master", f"Expected HEAD -> refs/heads/master, got: {target}"
+
+
+def test_refs_directory():
+    """Test browsing the refs directory structure."""
+    # refs directory should exist
+    machine.succeed("test -d /mnt/git/refs")
+
+    # refs/heads should exist
+    machine.succeed("test -d /mnt/git/refs/heads")
+
+    # List refs/heads - should contain master
+    output = machine.succeed("ls /mnt/git/refs/heads/")
+    assert "master" in output, f"Expected master in refs/heads/, got: {output}"
+
+
+def test_ref_symlink():
+    """Test that refs/heads/master is a symlink to the commit."""
+    # refs/heads/master should be a symlink
+    machine.succeed("test -L /mnt/git/refs/heads/master")
+
+    # Get the commit hash
+    commit_hash = machine.succeed("cd /tmp/test-repo && git rev-parse HEAD").strip()
+
+    # Read the symlink target - should be relative path to commits/<sha>
+    target = machine.succeed("readlink /mnt/git/refs/heads/master").strip()
+
+    # Should contain the commit hash
+    assert commit_hash in target, f"Expected target to contain {commit_hash}, got: {target}"
+    assert "commits/" in target, f"Expected target to contain 'commits/', got: {target}"
+
+
+def test_read_via_refs():
+    """Test reading files by following ref symlinks."""
+    # Read file through refs/heads/master (following symlink)
+    output = machine.succeed("cat /mnt/git/refs/heads/master/file1.txt")
+    assert "modified content" in output, f"Expected 'modified content', got: {output}"
+
+    # Also test via HEAD
+    output = machine.succeed("cat /mnt/git/HEAD/file1.txt")
+    assert "modified content" in output, f"Expected 'modified content' via HEAD, got: {output}"
+
+
+def test_refs_readonly():
+    """Test that refs are read-only."""
+    # Writing to a ref should fail
+    machine.fail("echo 'test' > /mnt/git/refs/heads/master/file1.txt")
+
+    # Creating files under refs should fail
+    machine.fail("touch /mnt/git/refs/heads/master/newfile.txt")
+
+
+def test_create_branch_and_tag():
+    """Test that new branches and tags appear in refs."""
+    # Create a new branch
+    machine.succeed("cd /tmp/test-repo && git branch feature-branch")
+
+    # refs/heads/feature-branch should now exist as a symlink
+    machine.succeed("test -L /mnt/git/refs/heads/feature-branch")
+
+    # Create a tag
+    machine.succeed("cd /tmp/test-repo && git tag v1.0")
+
+    # refs/tags should exist and contain v1.0
+    machine.succeed("test -d /mnt/git/refs/tags")
+    output = machine.succeed("ls /mnt/git/refs/tags/")
+    assert "v1.0" in output, f"Expected v1.0 in refs/tags/, got: {output}"
+
+    # refs/tags/v1.0 should be a symlink
+    machine.succeed("test -L /mnt/git/refs/tags/v1.0")
+
+
+def test_detached_head():
+    """Test HEAD symlink in detached HEAD state."""
+    # Get current commit
+    commit_hash = machine.succeed("cd /tmp/test-repo && git rev-parse HEAD").strip()
+
+    # Detach HEAD
+    machine.succeed(f"cd /tmp/test-repo && git checkout --detach {commit_hash}")
+
+    # HEAD should now point to commits/<sha>
+    target = machine.succeed("readlink /mnt/git/HEAD").strip()
+    assert f"commits/{commit_hash}" == target, f"Expected commits/{commit_hash}, got: {target}"
+
+    # Go back to master
+    machine.succeed("cd /tmp/test-repo && git checkout master")
+
+    # HEAD should point back to refs/heads/master
+    target = machine.succeed("readlink /mnt/git/HEAD").strip()
+    assert target == "refs/heads/master", f"Expected refs/heads/master, got: {target}"
+
+
+def test_root_listing():
+    """Test that root directory contains all expected entries."""
+    output = machine.succeed("ls /mnt/git/")
+    assert "index" in output, f"Expected 'index' in root listing, got: {output}"
+    assert "commits" in output, f"Expected 'commits' in root listing, got: {output}"
+    assert "refs" in output, f"Expected 'refs' in root listing, got: {output}"
+    assert "HEAD" in output, f"Expected 'HEAD' in root listing, got: {output}"
+
+
 # =============================================================================
 # Main Test Execution
 # =============================================================================
@@ -277,6 +387,30 @@ with subtest("mkdir error cases"):
 
 with subtest("rmdir error cases"):
     test_rmdir_errors()
+
+with subtest("Root directory listing"):
+    test_root_listing()
+
+with subtest("HEAD symlink"):
+    test_head_symlink()
+
+with subtest("refs directory structure"):
+    test_refs_directory()
+
+with subtest("ref symlink to commit"):
+    test_ref_symlink()
+
+with subtest("Read files via refs"):
+    test_read_via_refs()
+
+with subtest("refs are read-only"):
+    test_refs_readonly()
+
+with subtest("Create branch and tag"):
+    test_create_branch_and_tag()
+
+with subtest("Detached HEAD"):
+    test_detached_head()
 
 with subtest("Unmount"):
     unmount_git_fuse()
