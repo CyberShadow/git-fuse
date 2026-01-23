@@ -49,6 +49,7 @@ pragma(lib, "fuse");
 __gshared
 {
     Git repo;
+    bool[string] ephemeralDirs; // Directories created by mkdir that have no files
 }
 
 //==============================================================================
@@ -210,22 +211,47 @@ bool isIndexFile(string path)
     return !findIndexEntry(path).isNull;
 }
 
-/// Check if a path exists as a directory in the index
+/// Check if a path exists as a directory in the index (including ephemeral dirs)
 bool isIndexDir(string path)
 {
+    // Check ephemeral directories
+    if (path in ephemeralDirs)
+        return true;
+
+    // Check if any ephemeral dir is a child of this path
     auto prefix = path.length > 0 ? path ~ "/" : "";
+    foreach (ephPath; ephemeralDirs.byKey)
+        if (ephPath.startsWith(prefix))
+            return true;
+
+    // Check git index entries
     foreach (entry; getIndexEntries())
         if (entry.path.startsWith(prefix))
             return true;
     return false;
 }
 
-/// Get index entries in a directory
+/// Get index entries in a directory (including ephemeral subdirs)
 string[] getIndexDirEntries(string dirPath)
 {
     auto prefix = dirPath.length > 0 ? dirPath ~ "/" : "";
     bool[string] names;
 
+    // Include ephemeral directories
+    foreach (ephPath; ephemeralDirs.byKey)
+    {
+        if (ephPath.startsWith(prefix))
+        {
+            auto rest = ephPath[prefix.length .. $];
+            auto slashPos = rest.indexOf('/');
+            if (slashPos >= 0)
+                names[rest[0 .. slashPos]] = true;
+            else
+                names[rest] = true;
+        }
+    }
+
+    // Include git index entries
     foreach (entry; getIndexEntries())
     {
         if (entry.path.startsWith(prefix))
@@ -310,6 +336,61 @@ void removeIndexEntry(string path)
 void chmodIndexEntry(string path, bool executable)
 {
     repo.run("update-index", executable ? "--chmod=+x" : "--chmod=-x", path);
+}
+
+//==============================================================================
+// Ephemeral directory management
+//==============================================================================
+
+/// Add an ephemeral directory and all its parents
+void addEphemeralDir(string path)
+{
+    if (path.length == 0)
+        return;
+    ephemeralDirs[path] = true;
+    // Also ensure parent directories exist as ephemeral
+    auto parent = path.dirName;
+    if (parent != "." && parent.length > 0)
+        addEphemeralDir(parent);
+}
+
+/// Remove an ephemeral directory (does not affect parents)
+void removeEphemeralDir(string path)
+{
+    ephemeralDirs.remove(path);
+}
+
+/// Check if a directory has any files in the git index
+bool hasIndexFiles(string dirPath)
+{
+    auto prefix = dirPath.length > 0 ? dirPath ~ "/" : "";
+    foreach (entry; getIndexEntries())
+        if (entry.path.startsWith(prefix))
+            return true;
+    return false;
+}
+
+/// When a file is deleted, add its parent as ephemeral if it becomes empty
+void handleFileDeleted(string filePath)
+{
+    auto parent = filePath.dirName;
+    if (parent == "." || parent.length == 0)
+        return;
+
+    // If parent has no more files in git index, make it ephemeral
+    if (!hasIndexFiles(parent))
+        addEphemeralDir(parent);
+}
+
+/// When a file is created, remove its parent from ephemeral dirs
+void handleFileCreated(string filePath)
+{
+    auto parent = filePath.dirName;
+    while (parent != "." && parent.length > 0)
+    {
+        removeEphemeralDir(parent);
+        parent = parent.dirName;
+    }
 }
 
 
@@ -750,12 +831,23 @@ extern(C) nothrow
             if (indexPath.length == 0)
                 throw new ErrnoException("", EINVAL);
 
+            // Check parent directory exists
+            auto parent = indexPath.dirName;
+            if (parent != "." && parent.length > 0)
+            {
+                if (!isIndexDir(parent))
+                    throw new ErrnoException("", ENOENT);
+            }
+
             enforce(S_ISREG(mode), new ErrnoException("", EOPNOTSUPP));
 
             // Create empty blob and add to index (git update-index handles locking)
             auto emptyOid = writeBlob([]);
             auto gitMode = (mode & octal!111) ? octal!100755 : octal!100644;
             updateIndexEntry(gitMode, emptyOid, indexPath);
+
+            // Remove parent directories from ephemeral set since they now have files
+            handleFileCreated(indexPath);
         });
     }
 
@@ -769,18 +861,41 @@ extern(C) nothrow
 
             // git update-index --force-remove handles locking
             removeIndexEntry(fusePath.indexPath);
+
+            // If parent directory is now empty, make it ephemeral
+            handleFileDeleted(fusePath.indexPath);
         });
     }
 
     int fs_mkdir(const char* c_path, uint mode)
     {
         return fuseWrap({
-            // Git index doesn't track directories, only files
-            // We silently succeed for index directories
             auto path = c_path.fromStringz.idup;
             if (!path.startsWith("/index/"))
                 throw new ErrnoException("", EROFS);
-            // Just succeed - directories are implicit in git
+
+            auto indexPath = path[7 .. $]; // strip "/index/"
+            if (indexPath.length == 0)
+                throw new ErrnoException("", EEXIST);
+
+            // Check if already exists as file
+            if (isIndexFile(indexPath))
+                throw new ErrnoException("", EEXIST);
+
+            // Check if already exists as directory (git-backed or ephemeral)
+            if (isIndexDir(indexPath))
+                throw new ErrnoException("", EEXIST);
+
+            // Check parent exists
+            auto parent = indexPath.dirName;
+            if (parent != "." && parent.length > 0)
+            {
+                if (!isIndexDir(parent))
+                    throw new ErrnoException("", ENOENT);
+            }
+
+            // Create ephemeral directory
+            addEphemeralDir(indexPath);
         });
     }
 
@@ -797,7 +912,8 @@ extern(C) nothrow
             if (entries.length > 0)
                 throw new ErrnoException("", ENOTEMPTY);
 
-            // Empty directories don't exist in git, so just succeed
+            // Remove from ephemeral dirs if present
+            removeEphemeralDir(fusePath.indexPath);
         });
     }
 
@@ -816,6 +932,14 @@ extern(C) nothrow
 
             auto newIndexPath = toPathStr[7 .. $];
 
+            // Check target parent directory exists
+            auto targetParent = newIndexPath.dirName;
+            if (targetParent != "." && targetParent.length > 0)
+            {
+                if (!isIndexDir(targetParent))
+                    throw new ErrnoException("", ENOENT);
+            }
+
             // Find source entry
             auto entryOpt = findIndexEntry(fromPath.indexPath);
             if (entryOpt.isNull)
@@ -829,6 +953,10 @@ extern(C) nothrow
 
             updateIndexEntry(entry.mode, entry.oid, newIndexPath);
             removeIndexEntry(fromPath.indexPath);
+
+            // Update ephemeral directories
+            handleFileDeleted(fromPath.indexPath);
+            handleFileCreated(newIndexPath);
         });
     }
 
