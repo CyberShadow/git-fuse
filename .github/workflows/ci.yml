@@ -1,0 +1,22 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v18
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v11
+
+      - name: Build git-fuse
+        run: nix build --print-build-logs
+
+      - name: Run flake checks
+        run: nix flake check --print-build-logs
