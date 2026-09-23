@@ -1,0 +1,14 @@
+{
+  "name": "git-fuse",
+  "owner": {
+    "name": "Vladimir Panteleev"
+  },
+  "plugins": [
+    {
+      "name": "git-fuse",
+      "source": "./",
+      "description": "Agent skills for using git-fuse, such as splitting changes into atomic commits",
+      "strict": false
+    }
+  ]
+}

@@ -40,6 +40,25 @@ fusermount -u /tmp/mnt
 - `-f, --foreground` - run in foreground (don't daemonize)
 - `-o, --options=STR` - additional FUSE options (e.g. `debug`)
 
+## Agent skills
+
+The [`skills/`](skills/) directory contains [Agent Skills](https://agentskills.io/) that teach AI coding agents to use git-fuse:
+
+- [`git-fuse-atomic-commits`](skills/git-fuse-atomic-commits/SKILL.md) - split uncommitted changes into atomic commits, staging partial changes by editing the mounted index
+
+To install them with Claude Code:
+```
+/plugin marketplace add CyberShadow/git-fuse
+/plugin install git-fuse@git-fuse
+```
+
+For other agents, use [`npx skills`](https://github.com/vercel-labs/skills):
+```bash
+npx skills add CyberShadow/git-fuse
+```
+
+Or copy the skill directory into your agent's skills directory (e.g. `~/.claude/skills/`).
+
 ## Testing
 
 ```bash
