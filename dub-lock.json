@@ -4,9 +4,9 @@
       "version": "0.0.3672",
       "sha256": "1did2l2bdkjjhwlrwy9ynbcgx1d2kmhzclq4ihbiw7qrpp2bbh5v"
     },
-    "dfuse": {
-      "version": "0.4.1",
-      "sha256": "1hi90dbq6dpvdn2x5hz3qsmdh8dn0carg9rkjsl62nyj2i5wc4jz"
+    "oxfuse": {
+      "version": "0.9.1",
+      "sha256": "1jc16h6vhpw24n7gyzfnpqzhcmkiiz7xfsgfxa7mbiiz04g560hv"
     }
   }
 }

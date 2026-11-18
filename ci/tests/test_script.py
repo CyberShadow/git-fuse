@@ -30,7 +30,7 @@ def mount_git_fuse():
 
 def unmount_git_fuse():
     """Unmount the git-fuse filesystem."""
-    machine.succeed("fusermount -u /mnt/git || umount /mnt/git")
+    machine.succeed("fusermount3 -u /mnt/git || umount /mnt/git")
 
 
 def test_read_index():

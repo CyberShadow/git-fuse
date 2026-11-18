@@ -34,13 +34,12 @@ import std.stdio : stderr;
 import std.string;
 import std.typecons : Nullable;
 
-import c.fuse.fuse;
+import oxfuse.cfuse;
+import oxfuse.fuse_file_info : fuse_file_info;
 
 import ae.sys.git;
 import ae.utils.funopt;
 import ae.utils.main;
-
-pragma(lib, "fuse");
 
 
 //==============================================================================
@@ -740,7 +739,7 @@ string[] listTreeEntries(string commitSpec, string path)
 
 extern(C) nothrow
 {
-    int fs_getattr(const char* c_path, stat_t* s)
+    int fs_getattr(const char* c_path, stat_t* s, fuse_file_info* fi)
     {
         return fuseWrap({
             auto fusePath = FusePath.parse(c_path);
@@ -859,13 +858,13 @@ extern(C) nothrow
         });
     }
 
-    int fs_readdir(const char* c_path, void* buf, fuse_fill_dir_t filler, off_t offset, fuse_file_info* fi)
+    int fs_readdir(const char* c_path, void* buf, fuse_fill_dir_t filler, off_t offset, fuse_file_info* fi, ReadDirFlags flags)
     {
         return fuseWrap({
             auto fusePath = FusePath.parse(c_path);
 
-            filler(buf, cast(char*)".".toStringz, null, 0);
-            filler(buf, cast(char*)"..".toStringz, null, 0);
+            filler(buf, cast(char*)".".toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
+            filler(buf, cast(char*)"..".toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
 
             final switch (fusePath.type)
             {
@@ -873,17 +872,17 @@ extern(C) nothrow
                     throw new ErrnoException("", ENOENT);
 
                 case FusePath.Type.root:
-                    filler(buf, cast(char*)"index".toStringz, null, 0);
-                    filler(buf, cast(char*)"commits".toStringz, null, 0);
-                    filler(buf, cast(char*)"refs".toStringz, null, 0);
-                    filler(buf, cast(char*)"HEAD".toStringz, null, 0);
+                    filler(buf, cast(char*)"index".toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
+                    filler(buf, cast(char*)"commits".toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
+                    filler(buf, cast(char*)"refs".toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
+                    filler(buf, cast(char*)"HEAD".toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
                     return;
 
                 case FusePath.Type.indexRoot:
                 case FusePath.Type.indexDir:
                     auto dirPath = fusePath.type == FusePath.Type.indexRoot ? "" : fusePath.indexPath;
                     foreach (name; getIndexDirEntries(dirPath))
-                        filler(buf, cast(char*)name.toStringz, null, 0);
+                        filler(buf, cast(char*)name.toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
                     return;
 
                 case FusePath.Type.indexFile:
@@ -898,7 +897,7 @@ extern(C) nothrow
                     // List refs under this prefix
                     auto prefix = fusePath.commitOrRef;
                     foreach (name; getRefsChildren(prefix))
-                        filler(buf, cast(char*)name.toStringz, null, 0);
+                        filler(buf, cast(char*)name.toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
                     return;
 
                 case FusePath.Type.headSymlink:
@@ -908,7 +907,7 @@ extern(C) nothrow
                 case FusePath.Type.commitDir:
                 case FusePath.Type.refDir:
                     foreach (name; listTreeEntries(fusePath.commitOrRef, fusePath.treePath))
-                        filler(buf, cast(char*)name.toStringz, null, 0);
+                        filler(buf, cast(char*)name.toStringz, null, 0, FillDirFlags.FUSE_FILL_DIR_DEFAULTS);
                     return;
 
                 case FusePath.Type.commitFile:
@@ -918,7 +917,7 @@ extern(C) nothrow
         });
     }
 
-    int fs_read(const char* c_path, char* buf_ptr, size_t size, off_t offset, fuse_file_info* fi)
+    int fs_read(const char* c_path, ubyte* buf_ptr, size_t size, off_t offset, fuse_file_info* fi)
     {
         return fuseWrap({
             auto fusePath = FusePath.parse(c_path);
@@ -966,12 +965,12 @@ extern(C) nothrow
                 return 0;
 
             auto bytesToRead = min(size, data.length - offset);
-            buf_ptr[0 .. bytesToRead] = cast(char[])data[offset .. offset + bytesToRead];
+            buf_ptr[0 .. bytesToRead] = data[offset .. offset + bytesToRead];
             return cast(int)bytesToRead;
         });
     }
 
-    int fs_write(const char* c_path, const char* data_ptr, size_t size, off_t offset, fuse_file_info* fi)
+    int fs_write(const char* c_path, const ubyte* data_ptr, size_t size, off_t offset, fuse_file_info* fi)
     {
         return fuseWrap({
             auto fusePath = FusePath.parse(c_path);
@@ -1001,7 +1000,7 @@ extern(C) nothrow
                 content.length = endOffset;
 
             // Write new data
-            content[offset .. offset + size] = cast(ubyte[])data_ptr[0 .. size];
+            content[offset .. offset + size] = data_ptr[0 .. size];
 
             // Write blob and update index (git update-index handles locking)
             auto newOid = writeBlob(content);
@@ -1011,7 +1010,7 @@ extern(C) nothrow
         });
     }
 
-    int fs_truncate(const char* c_path, off_t length)
+    int fs_truncate(const char* c_path, off_t length, fuse_file_info* fi)
     {
         return fuseWrap({
             auto fusePath = FusePath.parse(c_path);
@@ -1155,9 +1154,13 @@ extern(C) nothrow
         });
     }
 
-    int fs_rename(const char* c_from, const char* c_to)
+    int fs_rename(const char* c_from, const char* c_to, uint flags)
     {
         return fuseWrap({
+            // RENAME_NOREPLACE / RENAME_EXCHANGE are not implemented.
+            if (flags != 0)
+                throw new ErrnoException("", EINVAL);
+
             auto fromPath = FusePath.parse(c_from);
 
             // Only index files can be renamed
@@ -1198,7 +1201,7 @@ extern(C) nothrow
         });
     }
 
-    int fs_chmod(const char* c_path, uint mode)
+    int fs_chmod(const char* c_path, uint mode, fuse_file_info* fi)
     {
         return fuseWrap({
             auto fusePath = FusePath.parse(c_path);
@@ -1342,13 +1345,12 @@ int gitFuse(
     auto c_args = new char*[args.length];
     foreach (i, arg; args)
         c_args[i] = cast(char*)arg.toStringz;
-    auto f_args = FUSE_ARGS_INIT(cast(int)c_args.length, c_args.ptr);
 
     stderr.writeln("Mounting Git repository: ", repoPath);
     stderr.writeln("Mount point: ", mountPath);
     scope(success) stderr.writeln("git-fuse exiting.");
 
-    return fuse_main(f_args.argc, f_args.argv, &fsops, null);
+    return fuse_main(cast(int)c_args.length, c_args.ptr, &fsops, null);
 }
 
 mixin main!(funopt!gitFuse);

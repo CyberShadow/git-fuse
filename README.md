@@ -32,7 +32,7 @@ Then browse:
 
 To unmount:
 ```bash
-fusermount -u /tmp/mnt
+fusermount3 -u /tmp/mnt
 ```
 
 ## Options

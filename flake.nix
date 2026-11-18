@@ -31,12 +31,18 @@
           dubLock = ./dub-lock.json;
 
           buildInputs = with pkgs; [
-            fuse
+            fuse3
           ];
 
           nativeBuildInputs = with pkgs; [
             pkg-config
           ];
+
+          # oxfuse's preGenerateCommands runs a script with a #!/bin/bash
+          # shebang.
+          postConfigure = ''
+            patchShebangs --build "$DUB_HOME"/packages/oxfuse
+          '';
 
           installPhase = ''
             runHook preInstall
@@ -67,7 +73,7 @@
           buildInputs = with pkgs; [
             dmd
             dub
-            fuse
+            fuse3
             pkg-config
           ];
         };
