@@ -497,6 +497,41 @@ int fuseWrap(scope void delegate() dg) nothrow
 }
 
 
+/// Validate a FUSE path at which a new index entry is to be created.
+/// Returns the path within the index.
+string parseNewIndexEntryPath(const char* c_path)
+{
+    auto fusePath = FusePath.parse(c_path);
+
+    // Can only create in index
+    if (fusePath.type != FusePath.Type.invalid)
+    {
+        // Path already exists or is a special path
+        if (fusePath.type == FusePath.Type.indexFile)
+            throw new ErrnoException("", EEXIST);
+        throw new ErrnoException("", EROFS);
+    }
+
+    auto path = c_path.fromStringz.idup;
+    if (!path.startsWith("/index/"))
+        throw new ErrnoException("", EROFS);
+
+    auto indexPath = path[7 .. $]; // strip "/index/"
+    if (indexPath.length == 0)
+        throw new ErrnoException("", EINVAL);
+
+    // Check parent directory exists
+    auto parent = indexPath.dirName;
+    if (parent != "." && parent.length > 0)
+    {
+        if (!isIndexDir(parent))
+            throw new ErrnoException("", ENOENT);
+    }
+
+    return indexPath;
+}
+
+
 //==============================================================================
 // Index operations (using git plumbing commands)
 //==============================================================================
@@ -1048,33 +1083,7 @@ extern(C) nothrow
     int fs_mknod(const char* c_path, uint mode, ulong dev)
     {
         return fuseWrap({
-            auto fusePath = FusePath.parse(c_path);
-
-            // Can only create in index
-            if (fusePath.type != FusePath.Type.invalid)
-            {
-                // Path already exists or is a special path
-                if (fusePath.type == FusePath.Type.indexFile)
-                    throw new ErrnoException("", EEXIST);
-                throw new ErrnoException("", EROFS);
-            }
-
-            // Check if this should be an index file
-            auto path = c_path.fromStringz.idup;
-            if (!path.startsWith("/index/"))
-                throw new ErrnoException("", EROFS);
-
-            auto indexPath = path[7 .. $]; // strip "/index/"
-            if (indexPath.length == 0)
-                throw new ErrnoException("", EINVAL);
-
-            // Check parent directory exists
-            auto parent = indexPath.dirName;
-            if (parent != "." && parent.length > 0)
-            {
-                if (!isIndexDir(parent))
-                    throw new ErrnoException("", ENOENT);
-            }
+            auto indexPath = parseNewIndexEntryPath(c_path);
 
             enforce(S_ISREG(mode), new ErrnoException("", EOPNOTSUPP));
 
@@ -1084,6 +1093,19 @@ extern(C) nothrow
             updateIndexEntry(gitMode, emptyOid, indexPath);
 
             // Remove parent directories from ephemeral set since they now have files
+            handleFileCreated(indexPath);
+        });
+    }
+
+    int fs_symlink(const char* c_target, const char* c_path)
+    {
+        return fuseWrap({
+            auto indexPath = parseNewIndexEntryPath(c_path);
+
+            // Git stores a symlink as a blob holding the target, with mode 120000
+            auto oid = writeBlob(cast(const(ubyte)[])c_target.fromStringz);
+            updateIndexEntry(octal!120000, oid, indexPath);
+
             handleFileCreated(indexPath);
         });
     }
@@ -1260,6 +1282,15 @@ extern(C) nothrow
                     target = getRefSymlinkTarget(fusePath.commitOrRef);
                     break;
 
+                case FusePath.Type.indexFile:
+                    auto entryOpt = findIndexEntry(fusePath.indexPath);
+                    if (entryOpt.isNull)
+                        throw new ErrnoException("", ENOENT);
+                    if ((entryOpt.get.mode & octal!170000) != octal!120000)
+                        throw new ErrnoException("", EINVAL);
+                    target = cast(string)readBlob(entryOpt.get.oid);
+                    break;
+
                 default:
                     throw new ErrnoException("", EINVAL);
             }
@@ -1322,6 +1353,7 @@ int gitFuse(
     fsops.write = &fs_write;
     fsops.truncate = &fs_truncate;
     fsops.mknod = &fs_mknod;
+    fsops.symlink = &fs_symlink;
     fsops.unlink = &fs_unlink;
     fsops.mkdir = &fs_mkdir;
     fsops.rmdir = &fs_rmdir;

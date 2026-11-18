@@ -235,6 +235,60 @@ def test_rmdir_errors():
     machine.succeed("rm -r /mnt/git/index/nonempty")
 
 
+def test_index_symlink():
+    """Test creating, reading, replacing and removing symlinks in the index."""
+    # Create a symlink
+    machine.succeed("ln -s file1.txt /mnt/git/index/link")
+    machine.succeed("test -L /mnt/git/index/link")
+    target = machine.succeed("readlink /mnt/git/index/link").strip()
+    assert target == "file1.txt", f"Expected link -> file1.txt, got: {target}"
+
+    # It is staged as a symlink whose blob holds the target
+    output = machine.succeed("cd /tmp/test-repo && git ls-files -s link")
+    assert output.startswith("120000 "), f"Expected mode 120000, got: {output}"
+    output = machine.succeed("cd /tmp/test-repo && git cat-file -p :link")
+    assert output == "file1.txt", f"Expected blob 'file1.txt', got: {output!r}"
+
+    # The link resolves within the mount
+    output = machine.succeed("cat /mnt/git/index/link")
+    assert output.strip() == "modified content", f"Expected 'modified content', got: {output}"
+
+    # Creating over an existing entry fails
+    machine.fail("ln -s other /mnt/git/index/link")
+
+    # Replace the existing link
+    machine.succeed("ln -sf subdir/nested.txt /mnt/git/index/link")
+    target = machine.succeed("readlink /mnt/git/index/link").strip()
+    assert target == "subdir/nested.txt", f"Expected link -> subdir/nested.txt, got: {target}"
+    output = machine.succeed("cd /tmp/test-repo && git cat-file -p :link")
+    assert output == "subdir/nested.txt", f"Expected blob 'subdir/nested.txt', got: {output!r}"
+
+    # Symlink in a subdirectory, to a dangling target
+    machine.succeed("ln -s ../nonexistent /mnt/git/index/subdir/dangling")
+    target = machine.succeed("readlink /mnt/git/index/subdir/dangling").strip()
+    assert target == "../nonexistent", f"Expected ../nonexistent, got: {target}"
+
+    # Symlink in a nonexistent directory fails
+    machine.fail("ln -s x /mnt/git/index/nonexistent/link")
+
+    # Rename preserves symlink-ness
+    machine.succeed("mv /mnt/git/index/link /mnt/git/index/link2")
+    machine.succeed("test -L /mnt/git/index/link2")
+    output = machine.succeed("cd /tmp/test-repo && git ls-files -s link2")
+    assert output.startswith("120000 "), f"Expected mode 120000, got: {output}"
+
+    # readlink on a regular file fails
+    machine.fail("readlink /mnt/git/index/file1.txt")
+
+    # Remove symlinks
+    machine.succeed("rm /mnt/git/index/link2 /mnt/git/index/subdir/dangling")
+    output = machine.succeed("cd /tmp/test-repo && git ls-files")
+    assert "link2" not in output and "dangling" not in output, f"Symlinks should be removed, got: {output}"
+
+    # Symlinks cannot be created outside the index
+    machine.fail("ln -s x /mnt/git/commits/link")
+
+
 def test_head_symlink():
     """Test that HEAD is a symlink pointing to the current branch."""
     # HEAD should be a symlink
@@ -366,6 +420,9 @@ with subtest("Create new file in index"):
 
 with subtest("Delete file from index"):
     test_delete_file()
+
+with subtest("Symlinks in index"):
+    test_index_symlink()
 
 with subtest("Read from commits"):
     test_read_commits()
